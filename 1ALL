@@ -1,0 +1,543 @@
+from SmartApi import SmartConnect  # or from smartapi.smartConnect import SmartConnect
+import pyotp, time, pytz
+from datetime import datetime, timedelta
+import pandas as pd
+from config import *
+import requests
+import numpy as np
+import json
+import os
+from collections import defaultdict
+import time
+from py_vollib.black_scholes import implied_volatility, greeks
+from py_vollib.black_scholes.greeks.analytical import delta, gamma, vega, theta, rho
+import psycopg2
+from psycopg2 import sql
+from psycopg2.extensions import AsIs
+import schedule
+import time as time_module
+
+STRIKE_DIFFERENCE = 100
+SYMBOL = "BANKNIFTY"  
+EXG = "NFO" #NFO OR BFO
+risk_free_rate = 0
+
+# At the top of your file, with other constants
+EXCHANGE = "NSE"
+TOKEN = "99926009" #99926000 nifty 99926074 MIDCAP 99919000 SENSEX 99926009 BANKNIFTY 99926037 FINNIFTY 99919012 BANKEX
+
+# Create an object of SmartConnect
+obj = SmartConnect(api_key=apikey)
+
+# Load JSON data
+def load_json_file(json_file_path):
+    with open(json_file_path, 'r') as file:
+        data = json.load(file)
+    return data
+
+json_data = load_json_file(r'C:\Users\prana\Desktop\code\OpenAPIScripMaster.json')
+
+def rate_limited_request(func, *args, **kwargs):
+    """
+    Rate-limited wrapper for API requests.
+    Ensures only 3 requests are made per second.
+    """
+    start_time = time.time()
+    result = func(*args, **kwargs)
+    elapsed_time = time.time() - start_time
+    if elapsed_time < 1/3:  # If the request took less than 1/3 second
+        time.sleep(1/3 - elapsed_time)  # Sleep for the remaining time
+    return result
+
+def login():
+    """
+    Function to login and return AUTH and FEED tokens.
+    """
+    data = obj.generateSession(username, pwd, pyotp.TOTP(token).now())
+    refreshToken = data['data']['refreshToken']
+    auth_token = data['data']['jwtToken']
+    feed_token = obj.getfeedToken()
+    return auth_token, feed_token
+
+def historical_data(exchange, token, from_date, to_date, timeperiod):
+    """
+    Function to fetch historical data and return it as a Pandas DataFrame.
+    """
+    try:
+        historicParam = {
+            "exchange": exchange,
+            "symboltoken": token,
+            "interval": timeperiod,
+            "fromdate": from_date, 
+            "todate": to_date
+        }
+        api_response = rate_limited_request(obj.getCandleData, historicParam)
+        data = api_response['data']
+        data = [row[:5] for row in data]  # Keep only the first 5 columns
+        columns = ['T', 'Open', 'High', 'Low', 'Close']
+        df = pd.DataFrame(data, columns=columns)
+        df['T'] = pd.to_datetime(df['T']).dt.tz_localize(None)  # Remove timezone
+        df.set_index('T', inplace=True)
+        return df
+    except Exception as e:
+        print("Historic Api failed: {}".format(e))
+        return None
+
+def find_nearest_expiry(data, symbol):
+    expiry_dates = set()
+    for item in data:
+        if item['name'] == symbol and item['instrumenttype'] == 'OPTIDX':
+            expiry_dates.add(item['expiry'])
+    
+    current_date = datetime.now().date()
+    nearest_expiry = None
+    min_diff = float('inf')
+    
+    for expiry in expiry_dates:
+        expiry_date = datetime.strptime(expiry, "%d%b%Y").date()
+        diff = (expiry_date - current_date).days
+        if diff < min_diff:
+            min_diff = diff
+            nearest_expiry = expiry
+    
+    return nearest_expiry
+
+def get_strike_tokens(data, symbol, expiry_date, strike_price):
+    strike_tokens = []
+    for item in data:
+        if item['name'] == symbol and item['expiry'] == expiry_date and item['strike'] == f"{strike_price}00.000000":
+            if item['instrumenttype'] == 'OPTIDX' and (item['symbol'].endswith('CE') or item['symbol'].endswith('PE')):
+                strike_tokens.append((item['token'], item['symbol']))
+    return strike_tokens
+
+def round_to_nearest_strike(price):
+    return round(price / STRIKE_DIFFERENCE) * STRIKE_DIFFERENCE
+
+def calculate_time_to_expiry(current_date, expiry_date):
+    # Set the expiry time to 15:30:00
+    expiry_datetime = datetime.combine(expiry_date.date(), datetime.strptime("15:30:00", "%H:%M:%S").time())
+    time_diff = expiry_datetime - current_date
+    days = time_diff.total_seconds() / (24 * 60 * 60)
+    return max(days / 365.0, 1e-10)  # Ensure time to expiry is not zero
+
+def calculate_greeks(option_type, underlying_price, strike, time_to_expiry, risk_free_rate, option_price):
+    try:
+        option_type = 'c' if option_type.lower() == 'ce' else 'p'
+        
+        # Calculate intrinsic value
+        intrinsic_value = max(0, underlying_price - strike) if option_type == 'c' else max(0, strike - underlying_price)
+        
+        # Check if the option price is above the intrinsic value
+        if option_price <= intrinsic_value:
+            raise ValueError("The option price is below or equal to the intrinsic value.")
+        
+        implied_vol = implied_volatility.implied_volatility(
+            option_price, underlying_price, strike, time_to_expiry, risk_free_rate, option_type
+        )
+        
+        greek_values = {
+            'implied_volatility': implied_vol,
+            'delta': delta(option_type, underlying_price, strike, time_to_expiry, risk_free_rate, implied_vol),
+            'gamma': gamma(option_type, underlying_price, strike, time_to_expiry, risk_free_rate, implied_vol),
+            'vega': vega(option_type, underlying_price, strike, time_to_expiry, risk_free_rate, implied_vol),
+            'theta': theta(option_type, underlying_price, strike, time_to_expiry, risk_free_rate, implied_vol),
+            'rho': rho(option_type, underlying_price, strike, time_to_expiry, risk_free_rate, implied_vol)
+        }
+        return greek_values
+    except Exception as e:
+        print(f"Error calculating Greeks: {e}")
+        return {k: np.nan for k in ['implied_volatility', 'delta', 'gamma', 'vega', 'theta', 'rho']}
+
+def save_to_postgresql(data, table_name, replace=False):
+    conn = None
+    try:
+        # Connect to the PostgreSQL database
+        conn = psycopg2.connect(
+            host="localhost",
+            database="0",
+            user="postgres",
+            password="postgres",
+            port="5432"
+        )
+        cur = conn.cursor()
+
+        # Ensure table_name is lowercase
+        table_name = table_name.lower()
+
+        # Create table if not exists
+        create_table_query = sql.SQL("""
+            CREATE TABLE IF NOT EXISTS {} (
+                timestamp TIMESTAMP WITH TIME ZONE,
+                spot_open FLOAT,
+                spot_close FLOAT,
+                rounded_strike_open INT,
+                rounded_strike_close INT,
+                call_open FLOAT,
+                call_close FLOAT,
+                put_open FLOAT,
+                put_close FLOAT,
+                synthetic_futures_open FLOAT,
+                synthetic_futures_close FLOAT,
+                synthetic_spot_open_difference FLOAT,
+                synthetic_spot_close_difference FLOAT,
+                straddle_open FLOAT,
+                straddle_close FLOAT,
+                call_iv_close FLOAT,
+                call_delta_close FLOAT,
+                put_iv_close FLOAT,
+                put_delta_close FLOAT,
+                iv_difference FLOAT
+            )
+        """).format(sql.Identifier(table_name))
+        cur.execute(create_table_query)
+
+        # Set the timezone for this database session
+        cur.execute("SET TIME ZONE 'Asia/Kolkata';")
+
+        # Convert the data to a DataFrame and handle duplicates
+        df = pd.DataFrame(data)
+        df['timestamp'] = pd.to_datetime(df['timestamp']).dt.tz_convert('Asia/Kolkata')
+        df = df.sort_values('timestamp').drop_duplicates('timestamp', keep='last')  # Remove duplicates based on timestamp
+        
+        # Convert the deduplicated DataFrame back to a list of dictionaries
+        insert_data = df.to_dict('records')
+
+        print(f"Number of rows to insert/update: {len(insert_data)}")
+        print(f"Sample data: {insert_data[0] if insert_data else 'No data'}")
+
+        if insert_data:
+            for row in insert_data:
+                if replace:
+                    # Delete existing row if it exists
+                    delete_query = sql.SQL("DELETE FROM {} WHERE timestamp = %s").format(sql.Identifier(table_name))
+                    cur.execute(delete_query, (row['timestamp'],))
+
+                # Insert new row
+                insert_query = sql.SQL("""
+                    INSERT INTO {} (timestamp, spot_open, spot_close, rounded_strike_open, rounded_strike_close,
+                        call_open, call_close, put_open, put_close, synthetic_futures_open, synthetic_futures_close,
+                        synthetic_spot_open_difference, synthetic_spot_close_difference, straddle_open, straddle_close,
+                        call_iv_close, call_delta_close, put_iv_close, put_delta_close, iv_difference)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """).format(sql.Identifier(table_name))
+                cur.execute(insert_query, (
+                    row['timestamp'], row['spot_open'], row['spot_close'], row['rounded_strike_open'],
+                    row['rounded_strike_close'], row['call_open'], row['call_close'], row['put_open'],
+                    row['put_close'], row['synthetic_futures_open'], row['synthetic_futures_close'],
+                    row['synthetic_spot_open_difference'], row['synthetic_spot_close_difference'],
+                    row['straddle_open'], row['straddle_close'], row['call_iv_close'],
+                    row['call_delta_close'], row['put_iv_close'], row['put_delta_close'],
+                    row['iv_difference']
+                ))
+
+            conn.commit()
+            print(f"Data successfully saved to PostgreSQL table: {table_name}")
+        else:
+            print("No data to insert")
+
+    except (Exception, psycopg2.Error) as error:
+        print("Error while connecting to PostgreSQL", error)
+
+    finally:
+        if conn:
+            cur.close()
+            conn.close()
+
+def reset_database():
+    """
+    Function to reset (clear) the database table before starting the script.
+    """
+    conn = None
+    try:
+        # Connect to the PostgreSQL database
+        conn = psycopg2.connect(
+            host="localhost",
+            database="0",
+            user="postgres",
+            password="postgres",
+            port="5432"
+        )
+        cur = conn.cursor()
+
+        # Truncate the table
+        table_name = f"{SYMBOL.lower()}_synthetic_futures"
+        truncate_query = sql.SQL("TRUNCATE TABLE {}").format(sql.Identifier(table_name))
+        cur.execute(truncate_query)
+
+        conn.commit()
+        print(f"Database table '{table_name}' has been reset.")
+
+    except (Exception, psycopg2.Error) as error:
+        print("Error while resetting the database:", error)
+
+    finally:
+        if conn:
+            cur.close()
+            conn.close()
+
+def fetch_and_insert_historical_data():
+    global df_underlying, data_cache
+
+    auth_token, feed_token = login()
+
+    thirty_days_ago = datetime.now() - timedelta(days=0)
+    from_date = thirty_days_ago.strftime("%Y-%m-%d 09:15")
+    to_date = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    timeperiod = "ONE_MINUTE"
+
+    # Fetch historical data for the underlying (NSE)
+    df_underlying = historical_data(EXCHANGE, TOKEN, from_date, to_date, timeperiod)
+
+    if df_underlying is not None:
+        # Find nearest expiry
+        nearest_expiry = find_nearest_expiry(json_data, SYMBOL)
+        
+        # Process and save initial historical data
+        initial_data = process_data(df_underlying, from_date, to_date, timeperiod, nearest_expiry)
+        save_to_postgresql(initial_data, f"{SYMBOL.lower()}_synthetic_futures")
+        print("Initial historical data processed and saved.")
+
+from pytz import timezone
+
+def process_data(df, from_date, to_date, timeperiod, nearest_expiry):
+    processed_data = []
+    kolkata_tz = timezone('Asia/Kolkata')
+    
+    for i in range(len(df)):
+        close_price = df['Close'].iloc[i]
+        open_price = df['Open'].iloc[i]
+        rounded_strike_open = round_to_nearest_strike(open_price)
+        rounded_strike_close = round_to_nearest_strike(close_price)
+        timestamp = df.index[i]
+        
+        # Initialize the dictionary for new strike prices
+        if rounded_strike_open not in data_cache:
+            data_cache[rounded_strike_open] = {'call': None, 'put': None}
+        
+        if rounded_strike_close not in data_cache:
+            data_cache[rounded_strike_close] = {'call': None, 'put': None}
+        
+        if data_cache[rounded_strike_open]['call'] is None or data_cache[rounded_strike_open]['put'] is None:
+            strike_tokens = get_strike_tokens(json_data, SYMBOL, nearest_expiry, rounded_strike_open)
+            call_token = None
+            put_token = None
+            
+            for token, option_type in strike_tokens:
+                if option_type.endswith('CE'):
+                    call_token = token
+                elif option_type.endswith('PE'):
+                    put_token = token
+            
+            print(f"Open Strike {rounded_strike_open}: Call Token = {call_token}, Put Token = {put_token}")
+            
+            if call_token and put_token:
+                call_df = rate_limited_request(historical_data, EXG, call_token, from_date, to_date, timeperiod)
+                put_df = rate_limited_request(historical_data, EXG, put_token, from_date, to_date, timeperiod)
+                
+                if call_df is not None and put_df is not None:
+                    data_cache[rounded_strike_open]['call'] = call_df
+                    data_cache[rounded_strike_open]['put'] = put_df
+                else:
+                    print(f"Failed to fetch data for strike {rounded_strike_open} at index {i}")
+            else:
+                print(f"No tokens found for strike {rounded_strike_open} at index {i}")
+        
+        # Do the same for rounded_strike_close
+        if data_cache[rounded_strike_close]['call'] is None or data_cache[rounded_strike_close]['put'] is None:
+            strike_tokens = get_strike_tokens(json_data, SYMBOL, nearest_expiry, rounded_strike_close)
+            call_token = None
+            put_token = None
+            
+            for token, option_type in strike_tokens:
+                if option_type.endswith('CE'):
+                    call_token = token
+                elif option_type.endswith('PE'):
+                    put_token = token
+            
+            print(f"Close Strike {rounded_strike_close}: Call Token = {call_token}, Put Token = {put_token}")
+            
+            if call_token and put_token:
+                call_df = rate_limited_request(historical_data, EXG, call_token, from_date, to_date, timeperiod)
+                put_df = rate_limited_request(historical_data, EXG, put_token, from_date, to_date, timeperiod)
+                
+                if call_df is not None and put_df is not None:
+                    data_cache[rounded_strike_close]['call'] = call_df
+                    data_cache[rounded_strike_close]['put'] = put_df
+                else:
+                    print(f"Failed to fetch data for strike {rounded_strike_close} at index {i}")
+            else:
+                print(f"No tokens found for strike {rounded_strike_close} at index {i}")
+        
+        # Rest of the processing logic remains the same
+        if data_cache[rounded_strike_open]['call'] is not None and data_cache[rounded_strike_open]['put'] is not None and \
+           data_cache[rounded_strike_close]['call'] is not None and data_cache[rounded_strike_close]['put'] is not None:
+            call_df_open = data_cache[rounded_strike_open]['call']
+            put_df_open = data_cache[rounded_strike_open]['put']
+            call_df_close = data_cache[rounded_strike_close]['call']
+            put_df_close = data_cache[rounded_strike_close]['put']
+            
+            # Check if the index exists in all DataFrames
+            if i < len(call_df_open) and i < len(put_df_open) and i < len(call_df_close) and i < len(put_df_close):
+                # Extract the open and close prices
+                spot_open = open_price
+                spot_close = close_price
+                call_open = call_df_open['Open'].iloc[i]
+                call_close = call_df_close['Close'].iloc[i]
+                put_open = put_df_open['Open'].iloc[i]
+                put_close = put_df_close['Close'].iloc[i]
+                
+                # Calculate the synthetic futures open and close prices for the current row
+                synthetic_futures_open = rounded_strike_open + (call_open - put_open)
+                synthetic_futures_close = rounded_strike_close + (call_close - put_close)
+                
+                # Calculate additional metrics
+                synthetic_spot_open_difference = synthetic_futures_open - spot_open
+                synthetic_spot_close_difference = synthetic_futures_close - spot_close
+                straddle_open = call_open + put_open
+                straddle_close = call_close + put_close
+                
+                # Calculate time to expiry
+                current_date = pd.to_datetime(timestamp)
+                expiry_date = datetime.strptime(nearest_expiry, "%d%b%Y")
+                time_to_expiry = calculate_time_to_expiry(current_date, expiry_date)
+                
+                # Skip Greeks calculation if time to expiry is less than 45 minutes
+                if time_to_expiry * 365 * 24 * 60 < 45:  # Convert years to minutes and compare
+                    call_greeks_open = {k: np.nan for k in ['implied_volatility', 'delta', 'gamma', 'vega', 'theta', 'rho']}
+                    put_greeks_open = {k: np.nan for k in ['implied_volatility', 'delta', 'gamma', 'vega', 'theta', 'rho']}
+                    call_greeks_close = {k: np.nan for k in ['implied_volatility', 'delta', 'gamma', 'vega', 'theta', 'rho']}
+                    put_greeks_close = {k: np.nan for k in ['implied_volatility', 'delta', 'gamma', 'vega', 'theta', 'rho']}
+                else:
+                    # Calculate Greeks for call and put options at open
+                    call_greeks_open = calculate_greeks('CE', spot_open, rounded_strike_open, time_to_expiry, risk_free_rate, call_open)
+                    put_greeks_open = calculate_greeks('PE', spot_open, rounded_strike_open, time_to_expiry, risk_free_rate, put_open)
+                    
+                    # Calculate Greeks for call and put options at close
+                    call_greeks_close = calculate_greeks('CE', spot_close, rounded_strike_close, time_to_expiry, risk_free_rate, call_close)
+                    put_greeks_close = calculate_greeks('PE', spot_close, rounded_strike_close, time_to_expiry, risk_free_rate, put_close)
+                
+                processed_data.append({
+                    'timestamp': timestamp.tz_localize('Asia/Kolkata'),
+                    'spot_open': spot_open,
+                    'spot_close': spot_close,
+                    'rounded_strike_open': rounded_strike_open,
+                    'rounded_strike_close': rounded_strike_close,
+                    'call_open': call_open,
+                    'call_close': call_close,
+                    'put_open': put_open,
+                    'put_close': put_close,
+                    'synthetic_futures_open': synthetic_futures_open.round(2),
+                    'synthetic_futures_close': synthetic_futures_close.round(2),
+                    'synthetic_spot_open_difference': synthetic_spot_open_difference.round(2),
+                    'synthetic_spot_close_difference': synthetic_spot_close_difference.round(2),
+                    'straddle_open': straddle_open.round(2),
+                    'straddle_close': straddle_close.round(2),
+                    'call_iv_close': call_greeks_close['implied_volatility'] * 100,  # Multiplied by 100
+                    'call_delta_close': call_greeks_close['delta'],
+                    'put_iv_close': put_greeks_close['implied_volatility'] * 100,  # Multiplied by 100
+                    'put_delta_close': put_greeks_close['delta'],
+                    'iv_difference': (call_greeks_close['implied_volatility'] - put_greeks_close['implied_volatility']) * 100,  # Multiplied by 100
+                })
+            else:
+                print(f"Skipping index {i} due to missing data")
+        else:
+            print(f"Data not available for strike {rounded_strike_open} or {rounded_strike_close} at index {i}")
+
+    return processed_data
+
+def fetch_and_insert_latest_data():
+    global df_underlying, data_cache
+
+    try:
+        # Get the current time and round it down to the last minute
+        current_time = datetime.now(timezone('Asia/Kolkata')).replace(second=0, microsecond=0)
+        
+        # Stop the script if it is after 15:30
+        if current_time.time() > datetime.strptime("15:30", "%H:%M").time():
+            print("Current time is after 15:30. Stopping the script.")
+            return
+        
+        # The minute we want to fetch data for is the previous minute
+        target_minute = current_time - timedelta(minutes=1)
+        
+        # Set the time range for the target minute
+        from_date = target_minute - timedelta(minutes=1)  # Subtract one minute from the target minute
+        to_date = target_minute
+        
+        from_date_str = from_date.strftime("%Y-%m-%d %H:%M")
+        to_date_str = to_date.strftime("%Y-%m-%d %H:%M")
+        
+        print(f"Fetching data from {from_date_str} to {to_date_str}")
+
+        # Fetch the latest underlying data
+        latest_underlying = historical_data(EXCHANGE, TOKEN, from_date_str, to_date_str, "ONE_MINUTE")
+
+        if latest_underlying is not None and not latest_underlying.empty:
+            print(f"Fetched underlying data: {latest_underlying}")
+            
+            # Find nearest expiry
+            nearest_expiry = find_nearest_expiry(json_data, SYMBOL)
+            print(f"Nearest expiry: {nearest_expiry}")
+            
+            # Check if ATM strike has changed
+            latest_close = latest_underlying['Close'].iloc[-1]
+            new_atm_strike = round_to_nearest_strike(latest_close)
+            
+            if 'previous_atm_strike' not in globals():
+                global previous_atm_strike
+                previous_atm_strike = new_atm_strike
+            
+            if new_atm_strike != previous_atm_strike:
+                print(f"ATM strike changed from {previous_atm_strike} to {new_atm_strike}")
+                # Clear the data cache for the new ATM strike to force fetching new data
+                if new_atm_strike in data_cache:
+                    del data_cache[new_atm_strike]
+                previous_atm_strike = new_atm_strike
+            
+            # Process the latest data
+            latest_data = process_data(latest_underlying, from_date_str, to_date_str, "ONE_MINUTE", nearest_expiry)
+            
+            print(f"Processed data: {latest_data}")
+
+            if latest_data:
+                # Save the latest data to PostgreSQL, replacing if it already exists
+                save_to_postgresql(latest_data, f"{SYMBOL.lower()}_synthetic_futures", replace=True)
+                print(f"Latest data processed and saved at {datetime.now(timezone('Asia/Kolkata')).strftime('%H:%M:%S')}")
+            else:
+                print("No data to save after processing")
+        else:
+            print(f"No new data available at {datetime.now(timezone('Asia/Kolkata')).strftime('%H:%M:%S')}")
+    except Exception as e:
+        print(f"Error fetching and inserting latest data: {e}")
+
+# Main execution
+if __name__ == "__main__":
+    # Reset the database before starting
+    reset_database()
+
+    # Initialize data_cache and previous_atm_strike
+    data_cache = {}
+    previous_atm_strike = None
+
+    # Check if the script is running after 15:30
+    current_time = datetime.now(timezone('Asia/Kolkata'))
+    if current_time.time() > datetime.strptime("15:30", "%H:%M").time():
+        print("Script started after 15:30. Fetching historical data and stopping.")
+        fetch_and_insert_historical_data()
+        exit()
+
+    # Fetch initial historical data
+    fetch_and_insert_historical_data()
+
+    # Schedule the fetch_and_insert_latest_data function to run every minute
+    schedule.every().minute.at(":00").do(fetch_and_insert_latest_data)
+
+    # Main loop to keep the script running and check the schedule
+    while True:
+        current_time = datetime.now(timezone('Asia/Kolkata'))
+        if current_time.time() > datetime.strptime("15:31", "%H:%M").time():
+            print("Reached 15:31. Stopping the script.")
+            break
+        schedule.run_pending()
+        time_module.sleep(1)
